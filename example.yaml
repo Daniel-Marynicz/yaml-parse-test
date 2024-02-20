@@ -1,0 +1,800 @@
+# file for ergonode.app
+version: "3.8"
+x-logging:
+    - &loki-options
+        loki-url: "http://some-url:3100/loki/api/v1/push"
+        loki-external-labels: "job=swarm,container_name={{.Name}},cluster=demo,app=${STACK_NAME:?Missing mandatory value for STACK_NAME}"
+        max-size: "32m"
+    - &logging
+        driver: loki
+        options:
+            <<: *loki-options
+    - &nginx-logging
+        driver: loki
+        options:
+            <<: *loki-options
+            loki-pipeline-stages: |
+                - docker: {}
+                - static_labels:
+                      level: 'info'
+                      job: 'swarm'
+                      type: 'log'
+                      component: nginx
+                      channel: '<no value>'
+                - multiline:
+                      firstline: '^/docker-entrypoint.sh|^/entrypoint|^Error:|^[0-9]{4}-[0-9A-Z:-]+ \w+|[0-9]{4}(/[0-9]{2}){2}\s|^([0-9]+\.){3}[0-9]+\s'
+                      max_wait_time: 3s
+                      max_lines: 255
+                - regex:
+                      #example log: 2023/02/02 11:37:54 [notice] 1#1: using the "epoll" event method
+                      expression: '^[0-9]{4}(/[0-9]{2}){2}\s[0-9:]+\s\[(?P<level>\w+)\]'
+                - template:
+                      source: level
+                      template: '{{ ToLower .Value }}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "warn"}}warning{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "crit"}}critical{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "emerg"}}emergency{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "<no value>"}}info{{else}}{{ .Value }}{{end}}'
+                - labels:
+                      level: level
+                - match:
+                      #example log: 127.0.0.1 - - [02/Feb/2023:11:38:07 +0000] "GET /healthcheck.json HTTP/1.1" 200 21
+                      selector: '{job="swarm"} |~ "^([0-9]+\\.){3}[0-9]+\\s"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                type: 'access'
+                - match:
+                      selector: '{job="swarm"} |~ "Error: context deadline exceeded"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - match:
+                      selector: '{swarm_service !~ "", swarm_stack !~ ""}'
+                      action: keep
+                      stages:
+                          - template:
+                                source: service
+                                template: '{{ regexReplaceAllLiteral (printf "^%s_" .swarm_stack) .swarm_service "" }}'
+                - labels:
+                      service: service
+    - &php-logging
+        driver: loki
+        options:
+            <<: *loki-options
+            loki-pipeline-stages: |
+                - docker: {}
+                - static_labels:
+                      level: 'info'
+                      job: 'swarm'
+                      channel: 'php'
+                      context: '{}'
+                      extra: '{}'
+                      component: php
+                      type: 'log'
+                - multiline:
+                      firstline: '^{|PHP Fatal error|PHP message:|^\[[0-9A-Za-z\s:-]+\]\s\w+|^([0-9]+\.){3}[0-9]+\s|^Error:|^[0-9]{4}-[0-9A-Z:-]+ \w+|^/entrypoint|^[0-9]{2}:[0-9:]+ \w+|^\[[0-9]{4}[0-9A-Z+.:-]+\] \w+\.'
+                      max_wait_time: 3s
+                      max_lines: 255
+                # match fixes ER-3198
+                - match:
+                      selector: '{job="swarm"} |~ "^{"'
+                      action: keep
+                      stages:
+                          - replace:
+                                expression: '(\n)'
+                                replace: ''
+                - json:
+                      expressions:
+                          message: message
+                          context: context
+                          level: level_name
+                          channel: channel
+                          extra: extra
+                - json:
+                      expressions:
+                          exception:
+                      source: context
+                - json:
+                      expressions:
+                          exceptionMessage: message
+                      source: exception
+                - regex:
+                      #example log: NOTICE: PHP message: PHP Fatal error:  Allowed memory size of 268435456 bytes exhausted
+                      expression: '^(?P<level>[A-Z]+):'
+                - regex:
+                      #example log: [02-Feb-2023 06:25:11] NOTICE: fpm is running, pid 1
+                      expression: '^\[[0-9]{2}[0-9A-Za-z+.:\s-]+\]\s(?P<level>\w+)'
+                - regex:
+                      #example log: 11:02:25 INFO     [channel] Message
+                      expression: '^[0-9]{2}:[0-9:]+ (?P<level>\w+)\s+\[(?P<channel>[^\]\.]+)\]'
+                - regex:
+                      #example log: [2023-02-01T08:23:36.615949+00:00] request.ERROR: Uncaught PHP Exception
+                      expression: '^\[[0-9]{4}[0-9A-Z+.:-]+\] (?P<channel>[^\]\.]+)\.(?P<level>\w+)'
+                - template:
+                      source: level
+                      template: '{{ ToLower .Value }}'
+                - template:
+                      source: channel
+                      template: '{{ ToLower .Value }}'
+                - labels:
+                      level: level
+                      channel: channel
+                      message: message
+                      context: context
+                      extra: extra
+                      exceptionMessage: exceptionMessage
+                - match:
+                      selector: '{job="swarm"} |~ "PHP Fatal error"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                                channel: 'php'
+                - match:
+                      selector: '{job="swarm"} |~ "Error: context deadline exceeded"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - match:
+                      selector: '{job="swarm"} |~ "Allowed memory size of [0-9]+ bytes exhausted"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'alert'
+                - match:
+                      selector: '{job="swarm"} |~ "server reached max_children setting"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'alert'
+                - match:
+                      selector: '{job="swarm"} |~ "^/entrypoint"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                channel: 'entrypoint'
+                - match:
+                      selector: '{job="swarm"} |~ "^([0-9a-fA-F]+[:]+)+|^[0-9\\.]+"'
+                      action: keep
+                      stages:
+                          -  static_labels:
+                                 type: 'access'
+                - match:
+                      selector: '{swarm_service !~ "", swarm_stack !~ ""}'
+                      action: keep
+                      stages:
+                          - template:
+                                source: service
+                                template: '{{ regexReplaceAllLiteral (printf "^%s_" .swarm_stack) .swarm_service "" }}'
+                - labels:
+                      service: service
+                - output:
+                      source: message
+
+    - &postgres-logging
+        driver: loki
+        options:
+            <<: *loki-options
+            loki-pipeline-stages: |
+                - docker: {}
+                - static_labels:
+                      level: 'info'
+                      job: 'swarm'
+                      type: 'log'
+                      component: postgresql
+                      channel: '<no value>'
+                - multiline:
+                      firstline: '^[0-9]{4}-[0-9-]+\s[0-9]{2}:[0-9:\.]+.*(INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC):'
+                      max_wait_time: 3s
+                      max_lines: 255
+                - regex:
+                      #example log: 2023-02-02 12:50:33.399 UTC [1370] FATAL:  password authentication failed for user "ergonode"
+                      expression: '^[0-9]{4}-[0-9-]+\s[0-9]{2}:[0-9:\.]+.*\s\[[0-9]+\]\s(?P<level>(INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC)):'
+                - template:
+                      source: level
+                      template: '{{ ToLower .Value }}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "log"}}info{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "fatal"}}error{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "panic"}}emergency{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "<no value>"}}info{{else}}{{ .Value }}{{end}}'
+                - labels:
+                      level: level
+                - match:
+                      selector: '{job="swarm"} |~ "password authentication failed for user"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - match:
+                      selector: '{job="swarm"} |~ "database \"\\w+\" does not exist"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - match:
+                      selector: '{swarm_service !~ "", swarm_stack !~ ""}'
+                      action: keep
+                      stages:
+                          - template:
+                                source: service
+                                template: '{{ regexReplaceAllLiteral (printf "^%s_" .swarm_stack) .swarm_service "" }}'
+                - labels:
+                      service: service
+
+    - &rabbitmq-logging
+        driver: loki
+        options:
+            <<: *loki-options
+            loki-pipeline-stages: |
+                - docker: {}
+                - static_labels:
+                      level: 'info'
+                      job: 'swarm'
+                      type: 'log'
+                      component: rabbitmq
+                      channel: '<no value>'
+                - multiline:
+                      firstline: '^(\x1B\[[0-9;]+m)?[0-9]{4}-[0-9-\s:\.+]+'
+                      max_wait_time: 3s
+                      max_lines: 255
+                
+                - regex:
+                      #example log: [ESC][38;5;214m2023-02-03 09:50:50.134373+00:00 [warning] <0.12742.0> client unexpectedly closed TCP connection[ESC][0m
+                      #example log: 2023-02-03 09:50:50.134373+00:00 [warning] <0.12742.0> client unexpectedly closed TCP connection[0m
+                      expression: '(?s)^(\x1B\[[0-9;]+m)?(?P<message>.*)'
+                - regex:
+                      #example log: [ESC][38;5;214m2023-02-03 09:50:50.134373+00:00 [warning] <0.12742.0> client unexpectedly closed TCP connection[ESC][0m
+                      #example log: 2023-02-03 09:50:50.134373+00:00 [warning] <0.12742.0> client unexpectedly closed TCP connection[ESC][0m
+                      expression: '^(\x1B\[[0-9;]+m)?[0-9]{4}-[0-9-\s:\.+]+\[?(?P<level>\w+)\]'
+                - template:
+                      source: level
+                      template: '{{ ToLower .Value }}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "critical"}}emergency{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "none"}}info{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "<no value>"}}info{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: message
+                      # remove  ESC char from logs
+                      template: '{{ regexReplaceAll  "(\\x1B\\[[0-9;]+m)" .Value "" }}'
+                - labels:
+                      level: level
+                - match:
+                      selector: '{job="swarm"} |~ "Error on AMQP connection"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'alert'
+                - match:
+                      selector: '{job="swarm"} |~ "invalid credentials"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - match:
+                      selector: '{job="swarm"} |~ "login refused"'
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - match:
+                      selector: "{job=\"swarm\"} |~ \"access to vhost '[\\\\w\\\\.]+' refused for user\""
+                      action: keep
+                      stages:
+                          - static_labels:
+                                level: 'emergency'
+                - output:
+                      source: message
+                - match:
+                      selector: '{swarm_service !~ "", swarm_stack !~ ""}'
+                      action: keep
+                      stages:
+                          - template:
+                                source: service
+                                template: '{{ regexReplaceAllLiteral (printf "^%s_" .swarm_stack) .swarm_service "" }}'
+                - labels:
+                      service: service
+
+    - &redis-logging
+        driver: loki
+        options:
+            <<: *loki-options
+            loki-pipeline-stages: |
+                - docker: {}
+                - static_labels:
+                      level: 'info'
+                      job: 'swarm'
+                      type: 'log'
+                      component: redis
+                      channel: '<no value>'
+                - multiline:
+                      firstline: '^[0-9]+\:[A-Z]\s[0-9]+\s\w+\s[0-9]{4}\s[0-9:\.]+\s'
+                      max_wait_time: 3s
+                      max_lines: 255
+                
+                - regex:
+                      #example log: 2417:C 23 Jan 2023 13:44:54.096 * RDB: 0 MB of memory used by copy-on-write
+                      expression: '^[0-9]+\:[A-Z]\s[0-9]+\s\w+\s[0-9]{4}\s[0-9:\.]+\s(?P<level>\W)'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "."}}debug{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "-"}}info{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "*"}}notice{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "#"}}warning{{else}}{{ .Value }}{{end}}'
+                - template:
+                      source: level
+                      template: '{{if eq .Value "<no value>"}}info{{else}}{{ .Value }}{{end}}'
+                - labels:
+                      level: level
+                - match:
+                      selector: '{swarm_service !~ "", swarm_stack !~ ""}'
+                      action: keep
+                      stages:
+                          - template:
+                                source: service
+                                template: '{{ regexReplaceAllLiteral (printf "^%s_" .swarm_stack) .swarm_service "" }}'
+                - labels:
+                      service: service
+
+    - &nuxtjs-logging
+        driver: loki
+        options:
+            <<: *loki-options
+            loki-pipeline-stages: |
+                - docker: {}
+                - static_labels:
+                      level: 'info'
+                      job: 'swarm'
+                      type: 'log'
+                      component: nuxtjs
+                      channel: '<no value>'
+                - match:
+                      selector: '{swarm_service !~ "", swarm_stack !~ ""}'
+                      action: keep
+                      stages:
+                          - template:
+                                source: service
+                                template: '{{ regexReplaceAllLiteral (printf "^%s_" .swarm_stack) .swarm_service "" }}'
+                - labels:
+                      service: service
+x-api:
+    - &api-environment
+        APP_ENV: ${APP_ENV:-prod}
+        DATABASE_URL: "pgsql://redacted:redacted@postgres:5432/redacted?serverVersion=10&charset=utf8"
+        MESSENGER_TRANSPORT_BATCH_ACTION_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/batch_action
+        MESSENGER_TRANSPORT_BATCH_ACTION_PUBLISHER_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/batch_action_publisher
+        MESSENGER_TRANSPORT_CHANNEL_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/channel
+        MESSENGER_TRANSPORT_EXPORT_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/export
+        MESSENGER_TRANSPORT_EXPORT_PUBLISHER_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/export_publisher
+        MESSENGER_TRANSPORT_IMPORT_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/import
+        MESSENGER_TRANSPORT_IMPORT_PUBLISHER_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/import_publisher
+        MESSENGER_TRANSPORT_NOTIFICATION_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/notification
+        MESSENGER_TRANSPORT_STATUS_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/status
+        MESSENGER_TRANSPORT_STATUS_PUBLISHER_DSN: amqp://${RABBITMQ_DEFAULT_USER:-***redacted***}:${RABBITMQ_DEFAULT_PASS:-***redacted***}@api_rabbitmq:5672/%2f/status_publisher
+    - &api-volumes
+        volumes:
+            - "storage:/app/api/storage:delegated"
+    - &api-service
+        image: some-registry.io/vendor/api:${IMAGE_TAG:-latest}
+        <<: *api-volumes
+        environment:
+            <<: *api-environment
+        deploy:
+            replicas: 1
+        logging:
+            <<: *php-logging
+    - &api-consumer
+        <<: *api-service
+        healthcheck:
+            disable: true
+x-legacy-apps-api:
+    - &legacy-apps-api-environment
+        APP_ENV: prod
+        DATABASE_URL: "***redacted***"
+        SOME-OTHER-ENVS: "das"
+    - &legacy-apps-api-volumes
+        volumes:
+            - apps_api_upload:/apps/api/upload:delegated
+    - &legacy-apps-api-service
+        image: some-registry.io/vendor/legacy-api:${IMAGE_TAG:-latest}
+        environment:
+            <<: *legacy-apps-api-environment
+        <<: *legacy-apps-api-volumes
+        logging:
+            <<: *php-logging
+x-importer:
+    - &importer-environment
+        APP_ENV: prod
+        DATABASE_URL: "pgsql://importer:redacted@importer_postgres:5432/importer?serverVersion=10&charset=utf8"
+        FILE_MAX_SIZE: "${IMPORTER_FILE_MAX_SIZE:-5M}"
+        IMPORT_STORAGE: "***redacted***"
+        IMPORT_STORAGE_DIRECTORY: "%kernel.project_dir%/uploaded_files/import"
+        MESSENGER_TRANSPORT_IMPORTER_DSN: amqp://ergonode:${RABBITMQ_DEFAULT_PASS:-***redacted***}@importer_rabbitmq:5672/%2f/importer-importer
+        MESSENGER_TRANSPORT_IMPORTER_PUBLISHER_DSN: amqp://ergonode:${RABBITMQ_DEFAULT_PASS:-***redacted***}@rabbitmq:5672/%2f/importer-importer_publisher
+        PIM_GRAPHQL_ENDPOINT: http://${STACK_NAME:?Missing mandatory value for STACK_NAME}_pim_nginx/internal-network/graphql/
+        PIM_NOTIFICATION_ENDPOINT: http://${STACK_NAME:?Missing mandatory value for STACK_NAME}_pim_nginx/internal-network/notifications
+        APP_IMPORTER_FRONTEND_URL: https://${APP_HOST:-localhost}/product-importer
+        REDIS_URL: redis://redis/1
+        SOURCE_STORAGE: "source.storage.local"
+        SOURCE_STORAGE_DIRECTORY: "%kernel.project_dir%/uploaded_files/source"
+    - &importer-volumes
+        volumes:
+            - "importer_docker:/app/importer/backend/config/docker:delegated"
+            - "importer_uploaded_files:/app/importer/backend/uploaded_files:delegated"
+    - &importer-service
+        image: ghcr.io/ergonode/importer-api:${IMAGE_TAG:-latest}
+        environment:
+            <<: *importer-environment
+        <<: *importer-volumes
+        logging:
+            <<: *php-logging
+        deploy:
+            replicas: 1
+    - &importer-consumer
+        <<: *importer-service
+        healthcheck:
+            disable: true
+x-apps-engine:
+    - &apps-engine-api-environment
+        APP_ENV: ${APP_ENV:-prod}
+        DATABASE_URL: "pgsql://redacted:redacted@apps_engine_postgres:5432/redacted?serverVersion=10&charset=utf8"
+        # some more envs
+        #...
+    - &apps-engine-api-service
+        image: some-registry.io/vendor/engine-api:${IMAGE_TAG:-latest}
+        environment:
+            <<: *apps-engine-api-environment
+        logging:
+            <<: *php-logging
+    - &apps-engine-api-consumer
+        <<: *apps-engine-api-service
+        healthcheck:
+            disable: true
+x-services:
+    - &postgres-service
+        image: postgres:12
+        environment:
+            POSTGRES_USER: "***redacted***"
+            POSTGRES_PASSWORD: "${POSTGRES_DEFAULT_PASS:-***redacted***}"
+            POSTGRES_DB: "***redacted***"
+        healthcheck:
+            test: [ 'CMD', 'psql', '--host', 'localhost', '--username', 'ergonode', '--dbname', 'postgres', '--quiet', '--no-align', '--tuples-only', '--command', 'SELECT 1' ]
+            interval: 10s
+        stop_grace_period: "2m"
+        logging:
+            <<: *postgres-logging
+    - &redis-service
+        image: redis:6.2
+        healthcheck:
+            test: [ "CMD", "redis-cli", "-e" ,"ping" ]
+            interval: 10s
+        stop_grace_period: "2m"
+        logging:
+            <<: *redis-logging
+    - &rabbitmq-service
+        image: rabbitmq:3.12
+        hostname: rabbitmq
+        environment:
+            RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-***redacted***}
+            RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-***redacted***}
+        healthcheck:
+            test: [ "CMD", "rabbitmq-diagnostics", "-q", "status" ]
+            interval: 10s
+        networks:
+            default:
+            reverse-proxy:
+        stop_grace_period: "2m"
+        logging:
+            <<: *rabbitmq-logging
+services:
+    api_upgrade:
+        <<: *api-service
+        environment:
+            <<: *api-environment
+            PHP_MEMORY_LIMIT: "-1"
+        deploy:
+            replicas: 1
+            restart_policy:
+                condition: on-failure
+                delay: 5s
+                max_attempts: 30
+        healthcheck:
+            disable: true
+        command:
+            - bin/console
+            - upgrade
+    api_batch_action_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - batch_action
+    api_batch_action_publisher_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - batch_action_publisher
+    api_channel_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - channel
+    api_export_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - export
+    api_export_publisher_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - export_publisher
+    api_notification_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - notification
+    api_status_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - status
+    api_status_publisher_consumer:
+        <<: *api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - status_publisher
+    api:
+        <<: *api-service
+    api_nginx:
+        image: some-registry.io/vendor/nginx:${IMAGE_TAG:-latest}
+        environment:
+            CLIENT_MAX_BODY_SIZE: ${API_NGINX_CLIENT_MAX_BODY_SIZE:-256m}
+            ERROR_LOG_LEVEL: ${API_NGINX_ERROR_LOG_LEVEL:-notice}
+            FASTCGI_READ_TIMEOUT: ${API_NGINX_FASTCGI_READ_TIMEOUT:-60s}
+            KEEPALIVE_TIMEOUT: ${API_NGINX_KEEPALIVE_TIMEOUT:-75s}
+            PHP_HOST: api:9000
+            WEB_DOCUMENT_ROOT: /app/api
+            WORKER_CONNECTIONS: ${API_NGINX_WORKER_CONNECTIONS:-1024}
+            WORKER_PROCESSES: ${API_NGINX_WORKER_PROCESSES:-2}
+        networks:
+            default:
+            reverse-proxy:
+        deploy:
+            restart_policy:
+                delay: 10s
+            update_config:
+                order: start-first
+            replicas: 1
+            labels:
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_pim_nginx.loadbalancer.server.port=80"
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_pim_nginx.loadbalancer.server.scheme=http"
+                # some more traefik labels
+                # ...
+            resources:
+                limits:
+                    memory: '250M'
+        healthcheck:
+            interval: 10s
+        logging:
+            <<: *nginx-logging
+    api_frontend_app:
+        image: some-registry.io/vendor/app:${IMAGE_TAG:-latest}
+        environment:
+            API_BASE_URL: ${APP_SCHEME:-https}://api-${APP_HOST:-localhost}/api/v1/
+            IMPORTER_FRONTEND_BASE_URL: "https://${APP_HOST:-localhost}/product-importer/"
+            LEGACY_APPS_API_BASE_URL: ${APP_SCHEME:-https}://apps-api-${APP_HOST:-localhost}/s/api/v1
+            APPS_ENGINE_API_BASE_URL: ${APP_SCHEME:-https}://api-apps-engine-${APP_HOST:-localhost}
+        healthcheck:
+            interval: 10s
+        deploy:
+            update_config:
+                order: start-first
+            labels:
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_pim_app.loadbalancer.server.port=7000"
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_pim_app.loadbalancer.server.scheme=http"
+                # some more traefik labels
+                # ...
+            resources:
+                limits:
+                    memory: '512M'
+        networks:
+            reverse-proxy:
+        logging:
+            <<: *nuxtjs-logging
+    api_rabbitmq:
+        <<: *rabbitmq-service
+        volumes:
+            - rabbitmq:/var/lib/rabbitmq:delegated
+    api_postgres:
+        <<: *postgres-service
+        volumes:
+            - postgres:/var/lib/postgresql/data:delegated
+    api_redis:
+        <<: *redis-service
+    legacy_apps_api:
+        <<: *legacy-apps-api-service
+    legacy_apps_async_consumer:
+        <<: *legacy-apps-api-service
+        healthcheck:
+            disable: true
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - async
+    legacy_apps_nginx:
+        image: ghcr.io/ergonode/apps-api-nginx:${IMAGE_TAG:-latest}
+        environment:
+            CLIENT_MAX_BODY_SIZE: ${LEGACY_APPS_NGINX_CLIENT_MAX_BODY_SIZE:-256m}
+            ERROR_LOG_LEVEL: ${LEGACY_APPS_NGINX_ERROR_LOG_LEVEL:-notice}
+            FASTCGI_READ_TIMEOUT: ${LEGACY_APPS_NGINX_FASTCGI_READ_TIMEOUT:-180s}
+            KEEPALIVE_TIMEOUT: ${LEGACY_APPS_NGINX_KEEPALIVE_TIMEOUT:-75s}
+            PHP_HOST: legacy_apps_api:9000
+            WEB_DOCUMENT_ROOT: /apps/api/public
+            WORKER_CONNECTIONS: ${LEGACY_APPS_NGINX_WORKER_CONNECTIONS:-1024}
+            WORKER_PROCESSES: ${LEGACY_APPS_NGINX_WORKER_PROCESSES:-2}
+        deploy:
+            labels:
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_apps_nginx.loadbalancer.server.port=80"
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_apps_nginx.loadbalancer.server.scheme=http"
+                # some more labels
+                # ...
+        networks:
+            default:
+            reverse-proxy:
+        logging:
+            <<: *php-logging
+    legacy_apps_postgres:
+        <<: *postgres-service
+        volumes:
+            - legacy_apps_postgres:/var/lib/postgresql/data:delegated
+    importer_api:
+        <<: *importer-service
+    importer_nginx:
+        image: ghcr.io/ergonode/importer-nginx:${IMAGE_TAG:-latest}
+        environment:
+            CLIENT_MAX_BODY_SIZE: ${IMPORTER_NGINX_CLIENT_MAX_BODY_SIZE:-256m}
+            ERROR_LOG_LEVEL: ${IMPORTER_NGINX_ERROR_LOG_LEVEL:-notice}
+            FASTCGI_READ_TIMEOUT: ${IMPORTER_NGINX_FASTCGI_READ_TIMEOUT:-60s}
+            KEEPALIVE_TIMEOUT: ${IMPORTER_NGINX_KEEPALIVE_TIMEOUT:-75s}
+            PHP_HOST:  importer_api:9000
+            WEB_DOCUMENT_ROOT: /app/importer/public
+            WORKER_CONNECTIONS: ${PIM_NGINX_WORKER_CONNECTIONS:-1024}
+            WORKER_PROCESSES: ${PIM_NGINX_WORKER_PROCESSES:-2}
+        networks:
+            default:
+            reverse-proxy:
+        deploy:
+            labels:
+                #backend configuration
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_importer_nginx.loadbalancer.server.port=${CONTAINER_HTTP_PORT:-80}"
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_importer_nginx.loadbalancer.server.scheme=http"
+                # some more labels
+                # ...
+        logging:
+            <<: *nginx-logging
+    importer_frontend_app:
+        image: ghcr.io/ergonode/importer-app:${IMAGE_TAG:-latest}
+        networks:
+            default:
+            reverse-proxy:
+        logging:
+            <<: *nuxtjs-logging
+    importer_consumer:
+        <<: *importer-service
+        command:
+            - bin/console
+            - messenger:consume
+            - --sleep=1
+            - --memory-limit=256M
+            - --time-limit=3600
+            - -vv
+            - importer
+        healthcheck:
+            disable: true
+    importer_postgres:
+        <<: *postgres-service
+    apps_engine_postgres:
+        <<: *postgres-service
+        volumes:
+            - apps_engine_postgres:/var/lib/postgresql/data:delegated
+    apps_engine_api:
+        <<: *apps-engine-api-service
+    apps_engine_nginx:
+        image: ghcr.io/ergonode/apps-engine-nginx:${IMAGE_TAG:-latest}
+        environment:
+            CLIENT_BODY_BUFFER_SIZE: ${APPS_ENGINE_CLIENT_BODY_BUFFER_SIZE:-32k}
+            CLIENT_MAX_BODY_SIZE: ${APPS_ENGINE_NGINX_CLIENT_MAX_BODY_SIZE:-256m}
+            ERROR_LOG_LEVEL: ${APPS_ENGINE_NGINX_ERROR_LOG_LEVEL:-notice}
+            FASTCGI_READ_TIMEOUT: ${APPS_ENGINE_NGINX_FASTCGI_READ_TIMEOUT:-180s}
+            KEEPALIVE_TIMEOUT: ${APPS_ENGINE_NGINX_KEEPALIVE_TIMEOUT:-75s}
+            LARGE_CLIENT_HEADER_BUFFERS_NUMBER: ${APPS_ENGINE_LARGE_CLIENT_HEADER_BUFFERS_NUMBER:-8}
+            LARGE_CLIENT_HEADER_BUFFERS_SIZE: ${APPS_ENGINE_LARGE_CLIENT_HEADER_BUFFERS_SIZE:-16k}
+            PHP_HOST: "apps_engine_api:9000"
+            WEB_DOCUMENT_ROOT: /apps/apps-engine/public
+            WORKER_CONNECTIONS: ${APPS_ENGINE_NGINX_WORKER_CONNECTIONS:-1024}
+            WORKER_PROCESSES: ${APPS_ENGINE_NGINX_WORKER_PROCESSES:-2}
+        healthcheck:
+            interval: 10s
+            start_period: 6m
+        logging:
+            <<: *nginx-logging
+        deploy:
+            replicas: 0
+            labels:
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_apps_engine_nginx.loadbalancer.server.port=80"
+                - "traefik.http.services.${STACK_NAME:?Missing mandatory value for STACK_NAME}_apps_engine_nginx.loadbalancer.server.scheme=http"
+                # some more labels
+
+        networks:
+            default:
+            reverse-proxy:
+    apps_engine_consumers:
+        <<: *apps-engine-api-consumer
+        command:
+            - bin/console
+            - messenger:consume
+            - --memory-limit=256M
+            - engine
+networks:
+    default:
+    reverse-proxy:
+        external: true
+volumes:
+    api_postgres:
+    api_rabbitmq:
+    apps_api_upload:
+    apps_engine_postgres:
+    importer_docker:
+    importer_postgres:
+    importer_uploaded_files:
+    legacy_apps_postgres:
+    postgres:
+    rabbitmq:
+    storage:
